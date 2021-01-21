@@ -61,7 +61,7 @@ class PermutohedralLayer(torch.nn.Module):
         permuted = PermutohedralFiltering.apply(x.permute(0,2,3,1).contiguous(), image.permute(0,2,3,1).contiguous(), self.bilateral,
             self.theta_alpha, self.theta_beta, self.theta_gamma)
         
-        return permuted.permute(0,3,1,2)
+        return permuted.permute(0,3,1,2).contiguous()
 
     def forward_old(self, x, image):
         if self.nhwc:
@@ -74,4 +74,4 @@ class PermutohedralLayer(torch.nn.Module):
         if self.nhwc:
             permuted = permuted.permute(0,3,1,2)
 
-        return permuted
+        return permuted.contiguous()

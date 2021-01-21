@@ -1,3 +1,4 @@
 *__pycache__
 _*.md
 .DS_Store
+.vscode

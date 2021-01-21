@@ -85,36 +85,46 @@ class FrankWolfeParams():
         stepsize (float, Optional): stepsize. Only applicable for the 'fixed' scheme.
         scheme (str, Optional): 'fixed', 'standard', 'linesearch'
     """
-    def __init__(self, stepsize=1.0, scheme='linesearch', regularizer=None):
+    def __init__(self, stepsize=1.0, scheme='linesearch', regularizer=None, lambda_=1.0, lambda_learnable=False, x0_weight=0.0, x0_weight_learnable=False):
         self.stepsize = stepsize
         self.scheme = scheme
         assert scheme in ['fixed', 'standard', 'linesearch']
         self.regularizer = regularizer
         assert regularizer in [None, 'negentropy', 'l2']
+        self.lambda_ = lambda_
+        self.lambda_learnable = lambda_learnable
+        self.x0_weight = x0_weight
+        self.x0_weight_learnable = x0_weight_learnable
 
     def __str__(self):
         return (f"FrankWolfeParams: \n\t scheme:\t {self.scheme} \n\t "
                 + f"stepsize:\t {self.stepsize} (for the 'fixed' scheme) \n\t "
-                + f"regularizer:\t {self.regularizer}")
+                + f"regularizer:\t {self.regularizer}\n\t "
+                + f"lambda_:\t {self.lambda_}\n\t "
+                + f"lambda_learnable:\t {self.lambda_learnable}\n\t "
+                + f"x0_weight:\t {self.x0_weight}\n\t "
+                + f"x0_weight_learnable:\t {self.x0_weight_learnable}")
 
 
 class GeneralCRF(nn.Module):
     r"""Base class for all CRFs
     """
     
-    def __init__(self, inference='mf', iterations=5, params=None,
+    def __init__(self, solver='mf', iterations=5, params=None,
                  ergodic=False, output_logits=True, print_energy=False):
 
         super().__init__()
         self.print_energy = print_energy
         self.iterations = iterations
         # self.classes = classes
-        self.inference = inference
+        self.solver = solver
         self.output_logits = output_logits
         self.ergodic = ergodic
         self.params = params
 
-        if inference == 'admm':
+        print(f'CRF solver: {solver}')
+
+        if solver == 'admm':
             if params is not None:
                 assert (type(params) is ADMMParams)
             else:
@@ -144,14 +154,28 @@ class GeneralCRF(nn.Module):
                 raise NotImplementedError
             else:
                 raise NotImplementedError
-        elif inference == 'fw':
+        elif solver == 'fw':
             if params is not None:
                 assert (type(params) is FrankWolfeParams)
             else:
                 print('Use default Frank-Wolfe parameters')
                 self.params = FrankWolfeParams()
-            
             print(self.params)
+
+            if self.params.lambda_learnable:
+                self.fw_lambda = torch.nn.Parameter(torch.tensor(self.params.lambda_))
+                print(f'Trainable lambda for Frank-Wolfe. Initialized at {self.params.lambda_}')
+            else:
+                self.fw_lambda = self.params.lambda_
+                print(f'Non-trainable lambda for Frank-Wolfe: {self.params.lambda_}')
+
+            if self.params.x0_weight_learnable:
+                self.fw_x0_weight = torch.nn.Parameter(torch.tensor(self.params.x0_weight))
+                print(f'Trainable x0_weight for Frank-Wolfe. Initialized at {self.params.x0_weight}')
+            else:
+                self.fw_x0_weight = self.params.x0_weight
+                print(f'Non-trainable x0_weight for Frank-Wolfe: {self.params.x0_weight}')
+
 
     def compute_pairwise(self, x, image):
         """Compute P * x
@@ -177,14 +201,16 @@ class GeneralCRF(nn.Module):
             image: (B, channels, H, W)
             unaries: (B, classes, H, W)
         """
-        if self.inference == 'mf':
+        if self.solver == 'mf':
             return self.mean_field(image, unaries, return_energy=return_energy)
-        elif self.inference == 'admm':
+        elif self.solver == 'admm':
             return self.admm(image, unaries, return_energy=return_energy)
-        elif self.inference == 'fw':
+        elif self.solver == 'fw':
             return self.frank_wolfe(image, unaries, return_energy=return_energy)
-        elif self.inference == 'pgd':
+        elif self.solver == 'pgd':
             return self.pgd(image, unaries, return_energy=return_energy)
+        elif self.solver == 'proxgrad':
+            return self.proximal_gradient(image, unaries, return_energy=return_energy)
         else:
             raise NotImplementedError
 
@@ -256,107 +282,6 @@ class GeneralCRF(nn.Module):
         return q_values
     
 
-    def frank_wolfe(self, image, unaries, return_energy=False):
-        """Frank-Wolfe algorithm
-        """
-
-        if self.iterations < 1:
-            return unaries
-
-        early_stopped = False
-
-        # initialization
-        x = F.softmax(unaries, dim=1)
-        Px = self.compute_pairwise(x, image)
-
-        # set the q_values
-        energies = torch.zeros(self.iterations + 1)
-        energies_discrete = torch.zeros(self.iterations +1)
-        for i in range(self.iterations):
-            
-            if self.print_energy or return_energy:
-                e = self.energy(x, image, unaries, pairwise=Px)
-                e_discrete = self.energy_discrete(x, image, unaries)
-                energies[i] = e
-                energies_discrete[i] = e_discrete
-                if self.print_energy:
-                    print(f'{i}) e = {e}, e_discrete = {e_discrete}')
-
-            # Gradient of energy
-            s = Px - unaries
-
-            if self.params.regularizer is None:
-                # Minimal solution of <s, gradient>
-                s = torch.argmin(s, dim=1, keepdim=True)
-                s = torch.zeros(unaries.shape, device=unaries.device).scatter_(1, s, 1)
-            elif self.params.regularizer == 'negentropy':
-                s = F.softmax(-s, dim=1)
-            elif self.params.regularizer == 'l2':
-                s = sparsemax(-s, dim=1)
-            else:
-                raise NotImplementedError
-
-            # Update x = x + alpha*(s - x)
-            s = s - x # r = s - x
-            if self.params.scheme == 'fixed' or self.params.scheme == 'standard':
-                if self.params.scheme == 'standard':
-                    alpha = 2.0/(2.0 + i)
-                else:
-                    alpha = self.params.stepsize
-                x += s*alpha
-                if i < self.iterations - 1 or self.print_energy or return_energy:
-                    Px = self.compute_pairwise(x, image)
-            else:
-                Pr = self.compute_pairwise(s, image)
-                A = torch.sum(s*Pr, dim=[1, 2, 3])
-                B = -torch.sum(s*unaries, dim=[1, 2, 3]) + torch.sum(x*Pr, dim=[1, 2, 3])
-                batch_size, c, h, w = unaries.shape
-                alphas = []
-                for idx in range(batch_size):
-                    # solve for each batch item: argmin_{alpha in [0, 1]} 1/2A*alpha^2 + B*alpha
-                    a = A[idx]
-                    b = B[idx]
-                    if a <= 0:
-                        alpha = 0.0 if 0.5*a + b > 0 else 1.0
-                    else: # if -b/a is in [0, 1] then take it, otherwise take either 0 or 1
-                        alpha = min(max(-b/a, 0.0), 1.0)
-                    # print(f'{i}) a = {a}, b = {b}, alpha = {alpha}')
-                    alpha = torch.ones((c, h, w), device=unaries.device)*alpha
-                    alphas.append(alpha)
-                # Make it (B, C, H, W)
-                alpha = torch.stack(alphas)
-                if torch.sum(alpha) <= 0:
-                    # print(f'Early stopping')
-                    early_stopped = True
-                    for idx in range(i+1, self.iterations + 1):
-                        energies[idx] = energies[i]
-                        energies_discrete[idx] = energies_discrete[i]
-                    break
-                x += s*alpha
-                # New Px: P*(x + alpha*r)
-                if i < self.iterations - 1 or self.print_energy or return_energy:
-                    Px += Pr*alpha
-
-                # Check discreteness
-                # savemat(torch.max(x[0], dim=0)[0].cpu(), path=f'tests/fw_x_{i+1}.png')
-
-        if not early_stopped and (self.print_energy or return_energy):
-            e = self.energy(x, image, unaries, pairwise=Px)
-            e_discrete = self.energy_discrete(x, image, unaries)
-            energies[i+1] = e
-            energies_discrete[i+1] = e_discrete
-            if self.print_energy:
-                print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
-        
-        if self.output_logits:
-            # De-softmax to return logits
-            x = torch.log(x + 1e-9)
-        
-        if return_energy:
-            return x, energies, energies_discrete
-        return x
-
-
     def pgd(self, image, unaries, return_energy=False):
         """Projected gradient descent
         """
@@ -411,9 +336,9 @@ class GeneralCRF(nn.Module):
                 # Make it (B, C, H, W)
                 alpha = torch.stack(alphas)
             
-            x += s*alpha
+            x = x + s*alpha
             # New Px: P*(x + alpha*r)
-            Px += Pr*alpha
+            Px = Px + Pr*alpha
 
         if self.print_energy or return_energy:
             e = self.energy(x, image, unaries, pairwise=Px)
@@ -432,7 +357,179 @@ class GeneralCRF(nn.Module):
         return x
 
 
-    def admm(self, image, unaries, return_energy=False):
+    def frank_wolfe(self, image, unaries, return_energy=False):
+        """Frank-Wolfe algorithm
+        """
+
+        if self.iterations < 1:
+            return unaries
+
+        early_stopped = False
+        x0_weight = self.fw_x0_weight
+        # x_weight = self.params.x_weight
+        x_weight = 1.0 - x0_weight
+
+        # initialization
+        x0 = F.softmax(unaries, dim=1)
+        x = x0
+        Px = self.compute_pairwise(x, image)
+
+        # set the q_values
+        energies = torch.zeros(self.iterations + 1)
+        energies_discrete = torch.zeros(self.iterations +1)
+        for i in range(self.iterations):
+            
+            if self.print_energy or return_energy:
+                e = self.energy(x_weight*x + x0_weight*x0, image, unaries, pairwise=Px)
+                e_discrete = self.energy_discrete(x_weight*x + x0_weight*x0, image, unaries)
+                energies[i] = e
+                energies_discrete[i] = e_discrete
+                if self.print_energy:
+                    print(f'{i}) e = {e}, e_discrete = {e_discrete}')
+
+            # Gradient of energy
+            s = Px - unaries
+
+            if self.params.regularizer is None:
+                # Minimal solution of <s, gradient>
+                s = torch.argmin(s, dim=1, keepdim=True)
+                s = torch.zeros(unaries.shape, device=unaries.device).scatter_(1, s, 1)
+                s.requires_grad_(True)
+            elif self.params.regularizer == 'negentropy':
+                s = F.softmax(-s/self.fw_lambda, dim=1)
+            elif self.params.regularizer == 'l2':
+                s = sparsemax(-s/self.fw_lambda, dim=1)
+            else:
+                raise NotImplementedError
+
+            # Update x = x + alpha*(s - x)
+            s = s - x # r = s - x
+            if self.params.scheme == 'fixed' or self.params.scheme == 'standard':
+                if self.params.scheme == 'standard':
+                    alpha = 2.0/(2.0 + i)
+                else:
+                    alpha = self.params.stepsize
+                x = x + s*alpha
+                if i < self.iterations - 1 or self.print_energy or return_energy:
+                    Px = self.compute_pairwise(x, image)
+            else:
+                Pr = self.compute_pairwise(s, image)
+                A = torch.sum(s*Pr, dim=[1, 2, 3])
+                B = -torch.sum(s*unaries, dim=[1, 2, 3]) + torch.sum(x*Pr, dim=[1, 2, 3])
+                batch_size, c, h, w = unaries.shape
+                alphas = []
+                for idx in range(batch_size):
+                    # solve for each batch item: argmin_{alpha in [0, 1]} 1/2A*alpha^2 + B*alpha
+                    a = A[idx]
+                    b = B[idx]
+                    if a <= 0:
+                        alpha = 0.0 if 0.5*a + b > 0 else 1.0
+                    else: # if -b/a is in [0, 1] then take it, otherwise take either 0 or 1
+                        alpha = min(max(-b/a, 0.0), 1.0)
+                    # print(f'{i}) a = {a}, b = {b}, alpha = {alpha}')
+                    alpha = torch.ones((c, h, w), device=unaries.device)*alpha
+                    alphas.append(alpha)
+                # Make it (B, C, H, W)
+                alpha = torch.stack(alphas)
+                if torch.sum(alpha) <= 0:
+                    # print(f'Early stopping')
+                    early_stopped = True
+                    for idx in range(i+1, self.iterations + 1):
+                        energies[idx] = energies[i]
+                        energies_discrete[idx] = energies_discrete[i]
+                    break
+                x = x + s*alpha
+                # New Px: P*(x + alpha*r)
+                if i < self.iterations - 1 or self.print_energy or return_energy:
+                    Px = Px + Pr*alpha
+
+                # Check discreteness
+                # savemat(torch.max(x[0], dim=0)[0].cpu(), path=f'tests/fw_x_{i+1}.png')
+
+        if x0_weight > 0:
+            x = x_weight*x + x0_weight*x0
+
+        if not early_stopped and (self.print_energy or return_energy):
+            e = self.energy(x, image, unaries, pairwise=Px)
+            e_discrete = self.energy_discrete(x, image, unaries)
+            energies[i+1] = e
+            energies_discrete[i+1] = e_discrete
+            if self.print_energy:
+                print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
+        
+        if self.output_logits:
+            # De-softmax to return logits
+            x = torch.log(x + 1e-9)
+        
+        if return_energy:
+            return x, energies, energies_discrete
+        return x
+
+
+    def proximal_gradient(self, image, unaries, return_energy=False):
+        """Accelerated proximal gradient algorithm (FISTA)
+        """
+
+        if self.iterations < 1:
+            return unaries
+
+        early_stopped = False
+
+        # initialization
+        x = F.softmax(unaries, dim=1)
+        y = x
+        Py = self.compute_pairwise(y, image)
+        t = 1
+        L = 1.0
+        alpha = 0
+
+        # set the q_values
+        energies = torch.zeros(self.iterations + 1)
+        energies_discrete = torch.zeros(self.iterations +1)
+        for i in range(self.iterations):
+            
+            if self.print_energy or return_energy:
+                if i == 0:
+                    Px = Py
+                else:
+                    Px = (1.0/(1.0 + alpha))*(Py + alpha*Px)
+                e = self.energy(x, image, unaries, pairwise=Px)
+                e_discrete = self.energy_discrete(x, image, unaries)
+                energies[i] = e
+                energies_discrete[i] = e_discrete
+                if self.print_energy:
+                    print(f'{i}) e = {e}, e_discrete = {e_discrete}')
+
+            # Projection
+            x_prev = x
+            x = sparsemax(y - (1.0/L)*(Py - unaries), dim=1)
+
+            if i < self.iterations - 1:
+                t_prev = t
+                t = 0.5*(1.0 + np.sqrt(1.0 + 4.0*t_prev**2))
+                alpha = (t_prev - 1)/t
+                y = x + (x - x_prev)*alpha
+                Py = self.compute_pairwise(y, image)
+
+
+        if self.print_energy or return_energy:
+            e = self.energy(x, image, unaries)
+            e_discrete = self.energy_discrete(x, image, unaries)
+            energies[i+1] = e
+            energies_discrete[i+1] = e_discrete
+            if self.print_energy:
+                print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
+        
+        if self.output_logits:
+            # De-softmax to return logits
+            x = torch.log(x + 1e-9)
+        
+        if return_energy:
+            return x, energies, energies_discrete
+        return x
+    
+
+    def admm_merge(self, image, unaries, return_energy=False):
         """
         Decomposition: 0.5x'Px + uz = 0.5x'Pz + 0.5ux + 0.5uz   
         """
@@ -524,7 +621,7 @@ class GeneralCRF(nn.Module):
         return x
 
     
-    def admm3(self, image, unaries, return_energy=False):
+    def admm(self, image, unaries, return_energy=False):
         """
         Decomposition: 0.5x'Px + uz = 0.5x'Pz + 0.5ux + 0.5uz   
         """
@@ -802,8 +899,8 @@ class GeneralCRF(nn.Module):
 
             # 1.a. Compute P*z
             # x = self.spatial_compat(self.spatial_weight(self.spatial_filter(z, image)))
-            # x += self.bilateral_compat(self.bilateral_weight(self.bilateral_filter(z, image)))
-            # x *= self.pairwise_scale
+            # x = x + self.bilateral_compat(self.bilateral_weight(self.bilateral_filter(z, image)))
+            # x = x * self.pairwise_scale
             x = self.compute_pairwise(z, image)
             
             if self.print_energy or return_energy:
@@ -931,11 +1028,11 @@ class GaussianCRF(GeneralCRF):
     def __init__(self, classes, alpha, beta, gamma,
                 spatial_weight=-1, bilateral_weight=-1, compatibility=-1,
                 init='potts', bias=False,
-                inference='mf', iterations=5, params=None,
+                solver='mf', iterations=5, params=None,
                 ergodic=False, output_logits=True, print_energy=False,
                 **kargs):
 
-        super().__init__(inference, iterations, params,
+        super().__init__(solver, iterations, params,
                 ergodic, output_logits, print_energy)
         
         self.classes = classes
@@ -1026,7 +1123,7 @@ class GaussianCRF(GeneralCRF):
         """
         Px = self.spatial_weight(self.spatial_filter(x, image))
         # print(f'spatial_out norm = {torch.norm(self.spatial_filter(x, image))}')
-        Px += self.bilateral_weight(self.bilateral_filter(x, image))
+        Px = Px + self.bilateral_weight(self.bilateral_filter(x, image))
         # print(f'bilateral_out norm = {torch.norm(self.bilateral_filter(x, image))}')
         # Px = self.spatial_weight(self.spatial_filter(x, image)) + self.bilateral_weight(self.bilateral_filter(x, image))
         # print(f'message_passing norm = {torch.norm(Px)}')
@@ -1044,7 +1141,7 @@ class GaussianCRF(GeneralCRF):
         x = self.bilateral_filter(x, image)
         # print(f'x shape = {x.shape}, bilateral shape = {self.bilateral_weight.shape}')
         x = torch.matmul(self.bilateral_weight, x.reshape(N, C, -1))
-        Px += x
+        Px = Px + x
         # print(f'x out shape = {x.shape}, Px shape = {Px.shape}')
         Px = torch.matmul(self.compatibility, Px)
         Px = Px.reshape(N, C, H, W)

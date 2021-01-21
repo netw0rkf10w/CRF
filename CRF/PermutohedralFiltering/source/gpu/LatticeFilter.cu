@@ -284,6 +284,14 @@ at::Tensor LatticeFilter_calculate_gpu(at::Tensor const & input_tensor,
         {
             latticeFilterGPU<5,46>(out_ptr, in_ptr, pos_ptr, num_super_pixels, backward);
         }
+        else if(pd==2 and vd==20)
+        {
+            latticeFilterGPU<2,20>(out_ptr, in_ptr, pos_ptr, num_super_pixels, backward);
+        }
+        else if(pd==5 and vd==20)
+        {
+            latticeFilterGPU<5,20>(out_ptr, in_ptr, pos_ptr, num_super_pixels, backward);
+        }
         else
         {
                 /**
