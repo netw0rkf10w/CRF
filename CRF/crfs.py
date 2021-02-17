@@ -111,7 +111,7 @@ class GeneralCRF(nn.Module):
     """
     
     def __init__(self, solver='mf', iterations=5, params=None,
-                 ergodic=False, output_logits=True, print_energy=False):
+                 ergodic=False, x0_weight=0.0, output_logits=True, print_energy=False):
 
         super().__init__()
         self.print_energy = print_energy
@@ -120,9 +120,11 @@ class GeneralCRF(nn.Module):
         self.solver = solver
         self.output_logits = output_logits
         self.ergodic = ergodic
+        self.x0_weight = x0_weight
         self.params = params
 
         print(f'CRF solver: {solver}')
+        print(f'x0_weight: {x0_weight}')
 
         if solver == 'admm':
             if params is not None:
@@ -225,6 +227,9 @@ class GeneralCRF(nn.Module):
         if self.iterations < 1:
             return unaries
 
+        x0_weight = self.x0_weight
+        x_weight = 1.0 - x0_weight
+
         # set the q_values
         q_values = unaries
         s = 0
@@ -232,6 +237,8 @@ class GeneralCRF(nn.Module):
         energies_discrete = torch.zeros(self.iterations +1)
         for i in range(self.iterations):
             q_values = F.softmax(q_values, dim=1)
+            if i == 0 and x0_weight > 0:
+                x0 = q_values
 
             if self.ergodic:
                 s = s + q_values
@@ -276,6 +283,14 @@ class GeneralCRF(nn.Module):
                     print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
             if not self.output_logits:
                 q_values = F.softmax(q_values, dim=1)
+                if x0_weight > 0:
+                    q_values = x_weight*q_values + x0_weight*x0
+            else:
+                if x0_weight > 0:
+                    # print(f'x0_weight: {x0_weight}')
+                    q_values = F.softmax(q_values, dim=1)
+                    q_values = x_weight*q_values + x0_weight*x0
+                    q_values = torch.log(q_values + 1e-9)
         
         if return_energy:
             return q_values, energies, energies_discrete
@@ -289,8 +304,11 @@ class GeneralCRF(nn.Module):
         if self.iterations < 1:
             return unaries
 
+        x0_weight = self.x0_weight
+        x_weight = 1.0 - x0_weight
         # initialization
-        x = F.softmax(unaries, dim=1)
+        x0 = F.softmax(unaries, dim=1)
+        x = x0
         Px = self.compute_pairwise(x, image)
 
         # set the q_values
@@ -348,6 +366,10 @@ class GeneralCRF(nn.Module):
             if self.print_energy:
                 print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
         
+        if x0_weight > 0:
+            # print(f'x0_weight: {x0_weight}')
+            x = x_weight*x + x0_weight*x0
+
         if self.output_logits:
             # De-softmax to return logits
             x = torch.log(x + 1e-9)
@@ -366,7 +388,6 @@ class GeneralCRF(nn.Module):
 
         early_stopped = False
         x0_weight = self.fw_x0_weight
-        # x_weight = self.params.x_weight
         x_weight = 1.0 - x0_weight
 
         # initialization
@@ -396,9 +417,15 @@ class GeneralCRF(nn.Module):
                 s = torch.zeros(unaries.shape, device=unaries.device).scatter_(1, s, 1)
                 s.requires_grad_(True)
             elif self.params.regularizer == 'negentropy':
-                s = F.softmax(-s/self.fw_lambda, dim=1)
+                if self.fw_lambda != 1:
+                    s = F.softmax(-s/self.fw_lambda, dim=1)
+                else:
+                    s = F.softmax(-s, dim=1)
             elif self.params.regularizer == 'l2':
-                s = sparsemax(-s/self.fw_lambda, dim=1)
+                if self.fw_lambda != 1:
+                    s = sparsemax(-s/self.fw_lambda, dim=1)
+                else:
+                    s = sparsemax(-s, dim=1)
             else:
                 raise NotImplementedError
 
@@ -475,8 +502,11 @@ class GeneralCRF(nn.Module):
 
         early_stopped = False
 
+        x0_weight = self.x0_weight
+        x_weight = 1.0 - x0_weight
         # initialization
-        x = F.softmax(unaries, dim=1)
+        x0 = F.softmax(unaries, dim=1)
+        x = x0
         y = x
         Py = self.compute_pairwise(y, image)
         t = 1
@@ -520,6 +550,10 @@ class GeneralCRF(nn.Module):
             if self.print_energy:
                 print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
         
+        if x0_weight > 0:
+            # print(f'x0_weight: {x0_weight}')
+            x = x_weight*x + x0_weight*x0
+
         if self.output_logits:
             # De-softmax to return logits
             x = torch.log(x + 1e-9)
@@ -529,7 +563,7 @@ class GeneralCRF(nn.Module):
         return x
     
 
-    def admm_merge(self, image, unaries, return_energy=False):
+    def admm(self, image, unaries, return_energy=False):
         """
         Decomposition: 0.5x'Px + uz = 0.5x'Pz + 0.5ux + 0.5uz   
         """
@@ -551,7 +585,11 @@ class GeneralCRF(nn.Module):
             x = torch.argmax(unaries, dim=1, keepdim=True)
             x = torch.zeros(unaries.shape, device=unaries.device).scatter_(1, x, 1)
         elif self.params.init == 'softmax':
-            x = F.softmax(unaries, dim=1)
+            x0_weight = self.x0_weight
+            x_weight = 1.0 - x0_weight
+            # initialization
+            x0 = F.softmax(unaries, dim=1)
+            x = x0
         elif self.params.init == 'mixed':
             if self.params.projection == 'bregman':
                 x = torch.ones_like(unaries)/classes
@@ -612,6 +650,10 @@ class GeneralCRF(nn.Module):
             if self.print_energy:
                 print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
 
+        if x0_weight > 0:
+            # print(f'x0_weight: {x0_weight}')
+            x = x_weight*x + x0_weight*x0
+
         if self.output_logits:
             # De-softmax to return logits
             x = torch.log(x + 1e-9)
@@ -621,7 +663,7 @@ class GeneralCRF(nn.Module):
         return x
 
     
-    def admm(self, image, unaries, return_energy=False):
+    def admm_xz(self, image, unaries, return_energy=False):
         """
         Decomposition: 0.5x'Px + uz = 0.5x'Pz + 0.5ux + 0.5uz   
         """
@@ -1029,11 +1071,11 @@ class GaussianCRF(GeneralCRF):
                 spatial_weight=-1, bilateral_weight=-1, compatibility=-1,
                 init='potts', bias=False,
                 solver='mf', iterations=5, params=None,
-                ergodic=False, output_logits=True, print_energy=False,
+                ergodic=False, x0_weight=0.0, output_logits=True, print_energy=False,
                 **kargs):
 
         super().__init__(solver, iterations, params,
-                ergodic, output_logits, print_energy)
+                ergodic, x0_weight, output_logits, print_energy)
         
         self.classes = classes
         self.alpha = alpha
