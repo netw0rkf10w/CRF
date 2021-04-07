@@ -5,7 +5,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-import pydensecrf.densecrf as dcrf
+try:
+    import pydensecrf.densecrf as dcrf
+except ModuleNotFoundError as e:
+    print(f'WARNING: no pydensecrf will be used.')
 
 from .PermutohedralFiltering.PermutohedralFiltering import PermutohedralLayer
 from .convcrf import *
@@ -563,7 +566,7 @@ class GeneralCRF(nn.Module):
         return x
     
 
-    def admm(self, image, unaries, return_energy=False):
+    def admm_x(self, image, unaries, return_energy=False):
         """
         Decomposition: 0.5x'Px + uz = 0.5x'Pz + 0.5ux + 0.5uz   
         """
@@ -663,7 +666,7 @@ class GeneralCRF(nn.Module):
         return x
 
     
-    def admm_xz(self, image, unaries, return_energy=False):
+    def admm(self, image, unaries, return_energy=False):
         """
         Decomposition: 0.5x'Px + uz = 0.5x'Pz + 0.5ux + 0.5uz   
         """
