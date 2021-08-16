@@ -91,7 +91,7 @@ class FrankWolfeParams():
     def __init__(self, stepsize=1.0, scheme='linesearch', regularizer=None, lambda_=1.0, lambda_learnable=False, x0_weight=0.0, x0_weight_learnable=False):
         self.stepsize = stepsize
         self.scheme = scheme
-        assert scheme in ['fixed', 'standard', 'linesearch']
+        assert scheme in ['fixed', 'standard', 'linesearch', 'learnable']
         self.regularizer = regularizer
         assert regularizer in [None, 'negentropy', 'l2']
         self.lambda_ = lambda_
@@ -181,6 +181,10 @@ class GeneralCRF(nn.Module):
                 self.fw_x0_weight = self.params.x0_weight
                 print(f'Non-trainable x0_weight for Frank-Wolfe: {self.params.x0_weight}')
 
+            if self.params.scheme == 'learnable':
+                self.alphas = torch.nn.Parameter(torch.tensor([self.params.stepsize]*iterations))
+                print(f'Trainable stepsizes for Frank-Wolfe. Initialized at: {self.alphas}')
+
 
     def compute_pairwise(self, x, image):
         """Compute P * x
@@ -207,17 +211,19 @@ class GeneralCRF(nn.Module):
             unaries: (B, classes, H, W)
         """
         if self.solver == 'mf':
-            return self.mean_field(image, unaries, return_energy=return_energy)
+            solver = self.mean_field
         elif self.solver == 'admm':
-            return self.admm(image, unaries, return_energy=return_energy)
+            solver = self.admm
         elif self.solver == 'fw':
-            return self.frank_wolfe(image, unaries, return_energy=return_energy)
+            solver = self.frank_wolfe
         elif self.solver == 'pgd':
-            return self.pgd(image, unaries, return_energy=return_energy)
+            solver = self.pgd
         elif self.solver == 'proxgrad':
-            return self.proximal_gradient(image, unaries, return_energy=return_energy)
+            solver = self.proximal_gradient
         else:
             raise NotImplementedError
+
+        return solver(image, unaries, return_energy=return_energy)
 
     def mean_field(self, image, unaries, return_energy=False):
         
@@ -328,7 +334,6 @@ class GeneralCRF(nn.Module):
                     print(f'{i}) e = {e}, e_discrete = {e_discrete}')
 
             # Project x - grad onto the constraint set
-            s = x - Px + unaries
             s = sparsemax(s, 1)
 
             # Update x = x + alpha*(s - x)
@@ -420,12 +425,12 @@ class GeneralCRF(nn.Module):
                 s = torch.zeros(unaries.shape, device=unaries.device).scatter_(1, s, 1)
                 s.requires_grad_(True)
             elif self.params.regularizer == 'negentropy':
-                if self.fw_lambda != 1:
+                if self.fw_lambda != 1 or isinstance(self.fw_lambda, torch.nn.Parameter):
                     s = F.softmax(-s/self.fw_lambda, dim=1)
                 else:
                     s = F.softmax(-s, dim=1)
             elif self.params.regularizer == 'l2':
-                if self.fw_lambda != 1:
+                if self.fw_lambda != 1 or isinstance(self.fw_lambda, torch.nn.Parameter):
                     s = sparsemax(-s/self.fw_lambda, dim=1)
                 else:
                     s = sparsemax(-s, dim=1)
@@ -434,15 +439,22 @@ class GeneralCRF(nn.Module):
 
             # Update x = x + alpha*(s - x)
             s = s - x # r = s - x
-            if self.params.scheme == 'fixed' or self.params.scheme == 'standard':
-                if self.params.scheme == 'standard':
-                    alpha = 2.0/(2.0 + i)
-                else:
-                    alpha = self.params.stepsize
+            if self.params.scheme == 'fixed':
+                alpha = self.params.stepsize
                 x = x + s*alpha
                 if i < self.iterations - 1 or self.print_energy or return_energy:
                     Px = self.compute_pairwise(x, image)
-            else:
+            elif self.params.scheme == 'standard':
+                alpha = 2.0/(2.0 + i)
+                x = x + s*alpha
+                if i < self.iterations - 1 or self.print_energy or return_energy:
+                    Px = self.compute_pairwise(x, image)
+            elif self.params.scheme == 'learnable':
+                alpha = self.alphas[i]
+                x = x + s*alpha
+                if i < self.iterations - 1 or self.print_energy or return_energy:
+                    Px = self.compute_pairwise(x, image)
+            elif self.params.scheme == 'linesearch':
                 Pr = self.compute_pairwise(s, image)
                 A = torch.sum(s*Pr, dim=[1, 2, 3])
                 B = -torch.sum(s*unaries, dim=[1, 2, 3]) + torch.sum(x*Pr, dim=[1, 2, 3])
@@ -475,6 +487,8 @@ class GeneralCRF(nn.Module):
 
                 # Check discreteness
                 # savemat(torch.max(x[0], dim=0)[0].cpu(), path=f'tests/fw_x_{i+1}.png')
+            else:
+                raise NotImplementedError
 
         if x0_weight > 0:
             x = x_weight*x + x0_weight*x0
@@ -1055,6 +1069,66 @@ class GeneralCRF(nn.Module):
             return z, energies, energies_discrete
         return z
 
+    
+    def prox_LP(self, image, unaries, return_energy=False):
+        """Ajanthan et al., Efficient Linear Programming for Dense CRFs
+        """
+
+        if self.iterations < 1:
+            return unaries
+
+        early_stopped = False
+
+        
+        
+        # set the q_values
+        energies = torch.zeros(self.iterations + 1)
+        energies_discrete = torch.zeros(self.iterations +1)
+        for i in range(self.iterations):
+            
+            if self.print_energy or return_energy:
+                if i == 0:
+                    Px = Py
+                else:
+                    Px = (1.0/(1.0 + alpha))*(Py + alpha*Px)
+                e = self.energy(x, image, unaries, pairwise=Px)
+                e_discrete = self.energy_discrete(x, image, unaries)
+                energies[i] = e
+                energies_discrete[i] = e_discrete
+                if self.print_energy:
+                    print(f'{i}) e = {e}, e_discrete = {e_discrete}')
+
+            # Projection
+            x_prev = x
+            x = sparsemax(y - (1.0/L)*(Py - unaries), dim=1)
+
+            if i < self.iterations - 1:
+                t_prev = t
+                t = 0.5*(1.0 + np.sqrt(1.0 + 4.0*t_prev**2))
+                alpha = (t_prev - 1)/t
+                y = x + (x - x_prev)*alpha
+                Py = self.compute_pairwise(y, image)
+
+
+        if self.print_energy or return_energy:
+            e = self.energy(x, image, unaries)
+            e_discrete = self.energy_discrete(x, image, unaries)
+            energies[i+1] = e
+            energies_discrete[i+1] = e_discrete
+            if self.print_energy:
+                print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
+        
+        if x0_weight > 0:
+            # print(f'x0_weight: {x0_weight}')
+            x = x_weight*x + x0_weight*x0
+
+        if self.output_logits:
+            # De-softmax to return logits
+            x = torch.log(x + 1e-9)
+        
+        if return_energy:
+            return x, energies, energies_discrete
+        return x
 
 
 class GaussianCRF(GeneralCRF):
@@ -1075,7 +1149,7 @@ class GaussianCRF(GeneralCRF):
                 init='potts', bias=False,
                 solver='mf', iterations=5, params=None,
                 ergodic=False, x0_weight=0.0, output_logits=True, print_energy=False,
-                **kargs):
+                **kwargs):
 
         super().__init__(solver, iterations, params,
                 ergodic, x0_weight, output_logits, print_energy)
@@ -1269,8 +1343,8 @@ class DenseGaussianCRF(GaussianCRF):
     .. _`Efficient inference in fully connected crfs with gaussian edge potentials`:
         https://arxiv.org/abs/1210.5644
         """
-    def __init__(self, **kargs):
-        super().__init__(**kargs)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         # Spatial kernel weights
         self.spatial_filter = PermutohedralLayer(bilateral=False,
                                                 theta_alpha=self.alpha,
@@ -1284,8 +1358,8 @@ class DenseGaussianCRF(GaussianCRF):
 
 
 class TruncatedGaussianCRF(GaussianCRF):
-    def __init__(self, classes, alpha, beta, gamma, window=-1, blur=1, **kargs):
-        super().__init__(classes, alpha, beta, gamma, **kargs)
+    def __init__(self, classes, alpha, beta, gamma, window=-1, blur=1, **kwargs):
+        super().__init__(classes, alpha, beta, gamma, **kwargs)
         self.window = window
         self.blur = blur
 
@@ -1331,6 +1405,7 @@ class TruncatedGaussianCRF(GaussianCRF):
         self.bilateral_filter = lambda x, im: perform_filtering(x, bilateral, blur=self.blur)
 
         return super().forward(image, unaries)
+
 
 
 class DenseGaussianCRF_cpu(nn.Module):
