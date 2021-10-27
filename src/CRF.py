@@ -8,11 +8,12 @@ from torch.nn import functional as F
 try:
     import pydensecrf.densecrf as dcrf
 except ModuleNotFoundError as e:
-    print(f'WARNING: no pydensecrf will be used.')
+    # print(f'WARNING: no pydensecrf will be used.')
+    pass
 
-from .PermutohedralFiltering.PermutohedralFiltering import PermutohedralLayer
-from .convcrf import *
-from .sparsemax import sparsemax
+from PermutohedralFiltering.PermutohedralFiltering import PermutohedralLayer
+from convcrf import *
+from sparsemax import sparsemax
 
 import matplotlib.pyplot as plt
 def savemat(x, path):
@@ -60,6 +61,24 @@ def unnormalize(tensor, mean, std, inplace=False):
     tensor.mul_(std).add_(mean)
     return tensor
 
+
+class CommonParams():
+    """ADMM parameter class
+
+    Args:
+        init (str, Optional): 'zeros', 'uniform', 'softmax', 'unary', 'unary_solution'
+    """
+    def __init__(self, args):
+        self.stepsize = args.crf_stepsize
+        self.scheme = args.crf_step_rule
+        self.x0_weight = args.crf_x0_weight
+        self.x0_weight_learnable = args.crf_x0_weight_learnable
+
+    def __str__(self):
+        return (f"CRF solver common parameters: \n\t scheme:\t {self.scheme} \n\t "
+                + f"stepsize:\t {self.stepsize} (for the 'fixed' scheme) \n\t "
+                + f"x0_weight:\t {self.x0_weight}\n\t "
+                + f"x0_weight_learnable:\t {self.x0_weight_learnable}")
 
 class ADMMParams():
     """ADMM parameter class
@@ -220,6 +239,8 @@ class GeneralCRF(nn.Module):
             solver = self.pgd
         elif self.solver == 'proxgrad':
             solver = self.proximal_gradient
+        elif self.solver == 'md':
+            solver = self.mirror_descent
         else:
             raise NotImplementedError
 
@@ -240,24 +261,24 @@ class GeneralCRF(nn.Module):
         x_weight = 1.0 - x0_weight
 
         # set the q_values
-        q_values = unaries
+        x = unaries
         s = 0
         energies = torch.zeros(self.iterations + 1)
         energies_discrete = torch.zeros(self.iterations +1)
         for i in range(self.iterations):
-            q_values = F.softmax(q_values, dim=1)
+            x = F.softmax(x, dim=1)
             if i == 0 and x0_weight > 0:
-                x0 = q_values
+                x0 = x
 
             if self.ergodic:
-                s = s + q_values
+                s = s + x
 
-            pairwise = self.compute_pairwise(q_values, image)
+            Px = self.compute_pairwise(x, image)
 
             if self.print_energy or return_energy:
                 if not self.ergodic:
-                    e = self.energy(q_values, image, unaries, pairwise=pairwise)
-                    e_discrete = self.energy_discrete(q_values, image, unaries)
+                    e = self.energy(x, image, unaries, pairwise=Px)
+                    e_discrete = self.energy_discrete(x, image, unaries)
                 else:
                     e = self.energy(s/(i+1), image, unaries)
                     e_discrete = self.energy_discrete(s/(i+1), image, unaries)
@@ -267,10 +288,10 @@ class GeneralCRF(nn.Module):
                     print(f'{i}) e = {e}, e_discrete = {e_discrete}')
 
             # 4. add pairwise terms
-            q_values = unaries - pairwise
+            x = unaries - Px
 
         if self.ergodic:
-            s = (s + F.softmax(q_values, dim=1))/(1+self.iterations)
+            s = (s + F.softmax(x, dim=1))/(1+self.iterations)
             if self.print_energy or return_energy:
                 e = self.energy(s, image, unaries)
                 e_discrete = self.energy_discrete(s, image, unaries)
@@ -280,10 +301,10 @@ class GeneralCRF(nn.Module):
                     print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
             if self.output_logits:
                 s = torch.log(s + 1e-9)
-            q_values = s
+            x = s
         else:
             if self.print_energy or return_energy:
-                q_normalized = F.softmax(q_values, dim=1)
+                q_normalized = F.softmax(x, dim=1)
                 e = self.energy(q_normalized, image, unaries)
                 e_discrete = self.energy_discrete(q_normalized, image, unaries)
                 energies[i+1] = e
@@ -291,19 +312,19 @@ class GeneralCRF(nn.Module):
                 if self.print_energy:
                     print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
             if not self.output_logits:
-                q_values = F.softmax(q_values, dim=1)
+                x = F.softmax(x, dim=1)
                 if x0_weight > 0:
-                    q_values = x_weight*q_values + x0_weight*x0
+                    x = x_weight*x + x0_weight*x0
             else:
                 if x0_weight > 0:
                     # print(f'x0_weight: {x0_weight}')
-                    q_values = F.softmax(q_values, dim=1)
-                    q_values = x_weight*q_values + x0_weight*x0
-                    q_values = torch.log(q_values + 1e-9)
+                    x = F.softmax(x, dim=1)
+                    x = x_weight*x + x0_weight*x0
+                    x = torch.log(x + 1e-9)
         
         if return_energy:
-            return q_values, energies, energies_discrete
-        return q_values
+            return x, energies, energies_discrete
+        return x
     
 
     def pgd(self, image, unaries, return_energy=False):
@@ -579,6 +600,64 @@ class GeneralCRF(nn.Module):
             return x, energies, energies_discrete
         return x
     
+
+    def mirror_descent(self, image, unaries, return_energy=False):
+        """Entropic mirror descent
+        """
+
+        if self.iterations < 1:
+            return unaries
+
+        x0_weight = self.params.x0_weight
+        x_weight = 1.0 - x0_weight
+
+        # initialization
+        x0 = F.softmax(unaries, dim=1)
+        x = x0
+        Px = self.compute_pairwise(x, image)
+
+        energies = torch.zeros(self.iterations + 1)
+        energies_discrete = torch.zeros(self.iterations +1)
+        for i in range(self.iterations):
+            
+            if self.print_energy or return_energy:
+                e = self.energy(x_weight*x + x0_weight*x0, image, unaries, pairwise=Px)
+                e_discrete = self.energy_discrete(x_weight*x + x0_weight*x0, image, unaries)
+                energies[i] = e
+                energies_discrete[i] = e_discrete
+                if self.print_energy:
+                    print(f'{i}) e = {e}, e_discrete = {e_discrete}')
+
+            # Gradient of energy times stepsize
+            alpha = self.params.stepsize
+            g = alpha*(Px - unaries)
+            
+            # Main update
+            x = x * torch.exp(torch.min(g, dim=1, keepdim=True)[0] - g)
+            x = x / torch.sum(x, dim=1, keepdim=True)
+
+            if i < self.iterations - 1 or self.print_energy or return_energy:
+                Px = self.compute_pairwise(x, image)
+            
+        if x0_weight > 0:
+            x = x_weight*x + x0_weight*x0
+
+        if self.print_energy or return_energy:
+            e = self.energy(x, image, unaries, pairwise=Px)
+            e_discrete = self.energy_discrete(x, image, unaries)
+            energies[i+1] = e
+            energies_discrete[i+1] = e_discrete
+            if self.print_energy:
+                print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
+        
+        if self.output_logits:
+            # De-softmax to return logits
+            x = torch.log(x + 1e-9)
+        
+        if return_energy:
+            return x, energies, energies_discrete
+        return x
+
 
     def admm_x(self, image, unaries, return_energy=False):
         """
@@ -1070,66 +1149,6 @@ class GeneralCRF(nn.Module):
         return z
 
     
-    def prox_LP(self, image, unaries, return_energy=False):
-        """Ajanthan et al., Efficient Linear Programming for Dense CRFs
-        """
-
-        if self.iterations < 1:
-            return unaries
-
-        early_stopped = False
-
-        
-        
-        # set the q_values
-        energies = torch.zeros(self.iterations + 1)
-        energies_discrete = torch.zeros(self.iterations +1)
-        for i in range(self.iterations):
-            
-            if self.print_energy or return_energy:
-                if i == 0:
-                    Px = Py
-                else:
-                    Px = (1.0/(1.0 + alpha))*(Py + alpha*Px)
-                e = self.energy(x, image, unaries, pairwise=Px)
-                e_discrete = self.energy_discrete(x, image, unaries)
-                energies[i] = e
-                energies_discrete[i] = e_discrete
-                if self.print_energy:
-                    print(f'{i}) e = {e}, e_discrete = {e_discrete}')
-
-            # Projection
-            x_prev = x
-            x = sparsemax(y - (1.0/L)*(Py - unaries), dim=1)
-
-            if i < self.iterations - 1:
-                t_prev = t
-                t = 0.5*(1.0 + np.sqrt(1.0 + 4.0*t_prev**2))
-                alpha = (t_prev - 1)/t
-                y = x + (x - x_prev)*alpha
-                Py = self.compute_pairwise(y, image)
-
-
-        if self.print_energy or return_energy:
-            e = self.energy(x, image, unaries)
-            e_discrete = self.energy_discrete(x, image, unaries)
-            energies[i+1] = e
-            energies_discrete[i+1] = e_discrete
-            if self.print_energy:
-                print(f'{i+1}) e = {e}, e_discrete = {e_discrete}')
-        
-        if x0_weight > 0:
-            # print(f'x0_weight: {x0_weight}')
-            x = x_weight*x + x0_weight*x0
-
-        if self.output_logits:
-            # De-softmax to return logits
-            x = torch.log(x + 1e-9)
-        
-        if return_energy:
-            return x, energies, energies_discrete
-        return x
-
 
 class GaussianCRF(GeneralCRF):
     """Base class for Gaussian CRFs
@@ -1415,7 +1434,6 @@ class DenseGaussianCRF_cpu(nn.Module):
     there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
     while the others are un-matched (and thus treated as non-objects).
     """
-
     def __init__(self, classes, height, width,
                 alpha=80.0, beta=13.0, gamma=3.0,
                 spatial_weight=-1, bilateral_weight=-1, compat=-1,
