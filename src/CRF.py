@@ -1,4 +1,7 @@
-"""Copyright 2020 D. Khue Le-Huu
+"""Copyright 2020 D.Khue Le-Huu
+If you use any part of this code, please cite the following paper:
+"Regularized Frank-Wolfe for Dense CRFs: Generalizing Mean Field and Beyond"
+published at NeurIPS 2021 by D.Khue Le-Huu and Karteek Alahari.
 """
 import numpy as np
 import torch
