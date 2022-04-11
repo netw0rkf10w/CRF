@@ -24,6 +24,17 @@ cd CRF
 python setup.py install
 ```
 
+The above should work for **PyTorch >= 1.6**, **CUDA >= 10.1**, and **cuDNN >= 7.6**. Most recently it has been tested for PyTorch 1.8-1.10, CUDA 10.1-11.3, and cuDNN 7.6-8.2 on NVIDIA Tesla V100 GPUs.
+
+**Important:** If you change CUDA or cuDNN or PyTorch versions, it is required to re-install the package as follows:
+
+```bash
+cd CRF
+rm -r build
+pip uninstall CRF 
+python setup.py install
+```
+
 ## Usage
 
 After having installed the package, you can create a CRF layer as follows:
