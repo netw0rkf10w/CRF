@@ -16,7 +16,29 @@ extra_compile_args = {
             'cxx': ['-Wno-unused-function', '-Wno-write-strings'],
             'nvcc': nvcc_ARCH,}
 
-setuptools.setup(name='CRF',
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+setuptools.setup(
+    name='CRF',
+    version='0.0.1',
+    author='Đ.Khuê Lê-Huu',
+    author_email='khue.le@inria.fr',
+    description='Conditional Random Fields for Computer Vision',
+    long_description=long_description,
+    long_description_content_type='text/markdown',
+    url='https://github.com/netw0rkf10w/CRF.git',
+    project_urls={
+        "Bug Tracker": "https://github.com/netw0rkf10w/CRF/issues",
+    },
+    classifiers=[
+        'Programming Language :: Python :: 3',
+        'License :: OSI Approved :: Apache Software License',
+        'Operating System :: OS Independent',
+    ],
+    package_dir={"": "src"},
+    packages=setuptools.find_packages(where="src"),
+    python_requires=">=3.6",
     ext_modules=[
             CppExtension(
                 'Permutohedral',
@@ -29,4 +51,4 @@ setuptools.setup(name='CRF',
             )
         ],
       cmdclass={'build_ext': BuildExtension}
-      )
+)

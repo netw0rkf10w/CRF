@@ -14,9 +14,9 @@ except ModuleNotFoundError as e:
     # print(f'WARNING: no pydensecrf will be used.')
     pass
 
-from PermutohedralFiltering.PermutohedralFiltering import PermutohedralLayer
-from convcrf import *
-from sparsemax import sparsemax
+from PermutohedralFiltering import PermutohedralLayer
+from .convcrf import create_position_feats, create_conv_filters, perform_filtering
+from .sparsemax import sparsemax
 
 import matplotlib.pyplot as plt
 def savemat(x, path):
@@ -1389,7 +1389,7 @@ class TruncatedGaussianCRF(GaussianCRF):
         """The bilateral filters are created on the fly
         """
         bsz, classes, height, width = unaries.shape
-
+        
         # Shape: (N, 2, H, W), the 2 dimensions correspond to x and y coordinates
         spatial = create_position_feats((height, width), bs=bsz)
         spatial = spatial.to(unaries.device)
